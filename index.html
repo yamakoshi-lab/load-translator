@@ -3,10 +3,10 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Infinite Scroll Translator (Stream Chunking)</title>
+    <title>Infinite Scroll Translator (OOM-Safe 50MB Edition)</title>
     <style>
         body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            font-family: -apple-system, BlinkMacSystemFont, sans-serif;
             line-height: 1.6;
             padding: 20px;
             max-width: 800px;
@@ -17,11 +17,15 @@
         #file-input-container {
             position: sticky;
             top: 0;
-            background: rgba(255, 255, 255, 0.9);
+            background: rgba(255, 255, 255, 0.95);
             padding: 15px;
             border-bottom: 1px solid #ddd;
             z-index: 100;
             backdrop-filter: blur(5px);
+        }
+        #content-container {
+            /* 削除したDOMの高さをここで補償し、スクロール位置を維持する */
+            padding-top: 0px; 
         }
         .chunk-container {
             margin-bottom: 40px;
@@ -29,7 +33,6 @@
             background: #fff;
             border-radius: 8px;
             box-shadow: 0 2px 4px rgba(0,0,0,0.05);
-            /* Chromeの翻訳エンジンがノードを認識しやすくする */
             contain: content; 
         }
         .chunk-container p {
@@ -62,37 +65,31 @@
 
 <script>
     // --- 物理定数・変数の定義 ---
-    const CHUNK_SIZE_BYTES = 30000; // 1回のI/Oで読み込むバイト数（約10,000文字）
-    const ROOT_MARGIN_PX = "500px"; // Sentinel検知のマージン距離
+    const CHUNK_SIZE_BYTES = 30000; 
+    const ROOT_MARGIN_PX = "1000px"; // 早めに読み込むためマージンを1000pxに拡張
+    const MAX_ACTIVE_CHUNKS = 50; // iOS RAM制限を回避するための最大ノード数
 
     let targetFile = null;
     let currentByteOffset = 0;
     let totalBytes = 0;
     let textDecoder = null;
     let isReading = false;
+    
+    // OOM回避用のガベージコレクション変数
+    let activeChunks = []; 
+    let currentPaddingTop = 0;
 
-    // DOM要素の取得
     const fileInput = document.getElementById('file-input');
     const contentContainer = document.getElementById('content-container');
     const sentinel = document.getElementById('sentinel');
     const statusIndicator = document.getElementById('status-indicator');
 
-    // --- IntersectionObserverの初期化 ---
-    const observerOptions = {
-        root: null, // viewportをルートとする
-        rootMargin: `0px 0px ${ROOT_MARGIN_PX} 0px`,
-        threshold: 0.01
-    };
-
     const observer = new IntersectionObserver((entries) => {
-        const entry = entries[0];
-        // Sentinelが検知領域に入り、かつ読み込み中でなく、ファイルが存在する場合
-        if (entry.isIntersecting && !isReading && targetFile && currentByteOffset < totalBytes) {
+        if (entries[0].isIntersecting && !isReading && targetFile && currentByteOffset < totalBytes) {
             readNextChunk();
         }
-    }, observerOptions);
+    }, { rootMargin: `0px 0px ${ROOT_MARGIN_PX} 0px`, threshold: 0.01 });
 
-    // --- ファイル選択時の初期化処理 ---
     fileInput.addEventListener('change', (event) => {
         const file = event.target.files[0];
         if (!file) return;
@@ -101,47 +98,39 @@
         totalBytes = file.size;
         currentByteOffset = 0;
         
-        // DOMと状態のリセット
         contentContainer.innerHTML = '';
-        textDecoder = new TextDecoder('utf-8'); // デコーダの再初期化
-        observer.observe(sentinel); // 監視開始
+        activeChunks = [];
+        currentPaddingTop = 0;
+        contentContainer.style.paddingTop = '0px';
+        
+        textDecoder = new TextDecoder('utf-8');
+        observer.observe(sentinel);
 
-        statusIndicator.textContent = `File Size: ${(totalBytes / 1024 / 1024).toFixed(2)} MB. スクロールで読み込みます。`;
-
-        // 最初のチャンクを即時読み込み
+        statusIndicator.textContent = `Size: ${(totalBytes / 1024 / 1024).toFixed(2)} MB. 下へスクロールで読み込み・翻訳開始`;
         readNextChunk();
     });
 
-    // --- チャンク読み込みアルゴリズム ---
     async function readNextChunk() {
         if (isReading || currentByteOffset >= totalBytes) return;
         isReading = true;
 
         try {
-            // スライス区間の計算: [currentByteOffset, nextOffset)
             const nextOffset = Math.min(currentByteOffset + CHUNK_SIZE_BYTES, totalBytes);
             const blobChunk = targetFile.slice(currentByteOffset, nextOffset);
-            
-            // ArrayBufferとして取得
             const arrayBuffer = await blobChunk.arrayBuffer();
 
-            // { stream: true } を指定し、マルチバイト文字の境界切断を防止
-            // 最後のチャンクの場合のみ stream: false とする
             const isLastChunk = nextOffset >= totalBytes;
             const decodedText = textDecoder.decode(arrayBuffer, { stream: !isLastChunk });
 
             appendChunkToDOM(decodedText);
-
-            // ポインタの更新
             currentByteOffset = nextOffset;
 
             if (isLastChunk) {
                 statusIndicator.textContent = "ファイルの終端に到達しました。";
-                observer.unobserve(sentinel); // 監視の解除
+                observer.unobserve(sentinel);
             } else {
                 statusIndicator.textContent = `Progress: ${(currentByteOffset / totalBytes * 100).toFixed(1)} %`;
             }
-
         } catch (error) {
             console.error("I/O Error:", error);
             statusIndicator.textContent = "読み込みエラーが発生しました。";
@@ -150,25 +139,33 @@
         }
     }
 
-    // --- DOMへのマウント処理 ---
     function appendChunkToDOM(text) {
         if (!text.trim()) return;
 
         const chunkWrapper = document.createElement('div');
         chunkWrapper.className = 'chunk-container';
 
-        // 改行文字で配列に分割し、pタグとして挿入（翻訳エンジンの文脈切断を防ぐ）
-        // 空行を詰めるために filter(Boolean) を適用
         const paragraphs = text.split(/\r?\n/).filter(Boolean);
-        
         paragraphs.forEach(paragraphText => {
             const p = document.createElement('p');
             p.textContent = paragraphText;
             chunkWrapper.appendChild(p);
         });
 
-        // コンテナの最後尾にアペンド（ここでChrome翻訳エンジンがMutationを検知する）
         contentContainer.appendChild(chunkWrapper);
+        activeChunks.push(chunkWrapper);
+
+        // --- OOM回避ロジック: 古いDOMの破棄とスクロール補償 ---
+        if (activeChunks.length > MAX_ACTIVE_CHUNKS) {
+            const oldestChunk = activeChunks.shift(); // 先頭（一番上）を取得
+            // 削除する要素の物理高さを取得
+            const chunkHeight = oldestChunk.offsetHeight;
+            // padding-topに加算してスクロール位置の破綻を防ぐ
+            currentPaddingTop += (chunkHeight + 40); // 40pxはmargin-bottom分
+            contentContainer.style.paddingTop = currentPaddingTop + 'px';
+            // メモリから完全削除
+            oldestChunk.remove(); 
+        }
     }
 </script>
 </body>
